@@ -1,6 +1,7 @@
 import argparse
 import difflib
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -114,6 +115,34 @@ def cmd_install(args):
         print(f"Created commit template at {template_rel}")
 
 
+def _claim_foreground():
+    """Become the foreground process group so Ctrl+C only signals us, not git."""
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
+        original_pgrp = os.tcgetpgrp(tty_fd)
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        os.setpgrp()
+        os.tcsetpgrp(tty_fd, os.getpgrp())
+        signal.signal(signal.SIGTTOU, old_ttou)
+        return tty_fd, original_pgrp
+    except OSError:
+        return None, None
+
+
+def _restore_foreground(tty_fd, original_pgrp):
+    """Restore the original foreground process group."""
+    if tty_fd is None:
+        return
+    try:
+        old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        os.tcsetpgrp(tty_fd, original_pgrp)
+        signal.signal(signal.SIGTTOU, old_ttou)
+    except OSError:
+        pass
+    finally:
+        os.close(tty_fd)
+
+
 def _run_claude_with_spinner(prompt):
     """Run claude CLI with a spinner, returning (stdout, stderr, returncode).
 
@@ -145,6 +174,11 @@ def _run_claude_with_spinner(prompt):
     thread = threading.Thread(target=communicate)
     thread.start()
 
+    # Become the foreground process group so Ctrl+C during the spinner only
+    # interrupts us (git-good), not the parent git process.
+    tty_fd, original_pgrp = _claim_foreground()
+
+    interrupted = False
     spinner_idx = 0
     try:
         while thread.is_alive():
@@ -160,13 +194,13 @@ def _run_claude_with_spinner(prompt):
     except KeyboardInterrupt:
         proc.kill()
         thread.join()
+        interrupted = True
+    finally:
         # Clear the spinner line
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr, flush=True)
-        return None
+        _restore_foreground(tty_fd, original_pgrp)
 
-    # Clear the spinner line
-    print("\r" + " " * 40 + "\r", end="", file=sys.stderr, flush=True)
-    return result
+    return None if interrupted else result
 
 
 def cmd_hook(args):
@@ -210,10 +244,7 @@ def cmd_hook(args):
         print("git-good: interrupted, leaving placeholder as-is", file=sys.stderr)
         return
     except Exception as e:
-        if isinstance(e, RuntimeError):
-            print(f"git-good: failed to generate message: {e}", file=sys.stderr)
-        else:
-            print(f"git-good: failed to generate message: {e}", file=sys.stderr)
+        print(f"git-good: failed to generate message: {e}", file=sys.stderr)
         print("git-good: leaving placeholder as-is", file=sys.stderr)
         return
 
