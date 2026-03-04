@@ -7,6 +7,7 @@ Produces demo.cast, then calls svg-term to create demo.svg.
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,10 +17,25 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 CAST_FILE = os.path.join(PROJECT_DIR, "demo.cast")
 SVG_FILE = os.path.join(PROJECT_DIR, "demo.svg")
-MOCK_PORT = 18924
 
 WIDTH = 80
 HEIGHT = 24
+
+# Mock claude CLI that returns a plausible commit message.
+# Placed on PATH ahead of the real claude during demo recording.
+MOCK_CLAUDE_SCRIPT = """\
+#!/usr/bin/env python3
+import sys, time
+time.sleep(0.3)
+prompt = sys.stdin.read()
+if "add" in prompt.lower() or "subtract" in prompt.lower():
+    print("Add arithmetic helper functions")
+    print()
+    print("- Introduce add() and subtract() utilities with docstrings")
+    print("- Provide basic math operations for reuse across the project")
+else:
+    print("Update project files")
+"""
 
 
 class CastWriter:
@@ -69,28 +85,23 @@ class CastWriter:
 
 
 def run(cmd, cwd=None, env=None):
-    """Run a command and return stdout."""
+    """Run a command and return stdout + stderr."""
     merged_env = {**os.environ, **(env or {})}
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=merged_env)
     return r.stdout + r.stderr
 
 
 def main():
-    # Start mock API server
-    mock_env = {**os.environ}
-    mock_proc = subprocess.Popen(
-        [sys.executable, os.path.join(SCRIPT_DIR, "mock_api.py"), str(MOCK_PORT)],
-        stdout=subprocess.PIPE,
-        text=True,
-        env=mock_env,
-    )
-    mock_proc.stdout.readline()  # wait for port print
-    time.sleep(0.3)
+    # Create mock claude CLI
+    mock_dir = tempfile.mkdtemp()
+    mock_claude = os.path.join(mock_dir, "claude")
+    with open(mock_claude, "w") as f:
+        f.write(MOCK_CLAUDE_SCRIPT)
+    os.chmod(mock_claude, os.stat(mock_claude).st_mode | stat.S_IEXEC)
 
     demo_env = {
         **os.environ,
-        "ANTHROPIC_API_KEY": "sk-ant-demo-key",
-        "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{MOCK_PORT}",
+        "PATH": f"{mock_dir}:{os.environ['PATH']}",
     }
 
     # Create temp demo repo
@@ -105,26 +116,32 @@ def main():
 
         app_py = os.path.join(repo_dir, "app.py")
         with open(app_py, "w") as f:
-            f.write('def greet(name):\n    return f"Hello, {name}!"\n\nif __name__ == "__main__":\n    print(greet("world"))\n')
+            f.write(
+                'def greet(name):\n'
+                '    return f"Hello, {name}!"\n'
+                '\n'
+                'if __name__ == "__main__":\n'
+                '    print(greet("world"))\n'
+            )
         run(["git", "add", "app.py"], cwd=repo_dir)
         run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir)
 
-        # Install the package
+        # Install the package into the project venv
         run(["uv", "pip", "install", "-e", "."], cwd=PROJECT_DIR)
 
-        # Start recording
+        # ── Start recording ─────────────────────────────────────────────
         cast = CastWriter(CAST_FILE, WIDTH, HEIGHT)
 
         cast.blank()
         cast.comment("# git-good: AI-powered commit messages via git hooks")
         cast.pause(1.5)
 
+        # Step 1 — install the hook
         cast.blank()
         cast.comment("# Step 1: Install the hook in your repo")
         cast.pause(0.8)
 
-        install_cmd = f"git-good install"
-        cast.type_cmd(install_cmd)
+        cast.type_cmd("git-good install")
         output = run(
             ["uv", "run", "--project", PROJECT_DIR, "git-good", "install"],
             cwd=repo_dir,
@@ -134,17 +151,29 @@ def main():
             cast.output(line)
         cast.pause(1.0)
 
-        # Patch the hook to use uv run
+        # Patch the hook so it uses `uv run` and finds the mock claude
         hook_path = os.path.join(repo_dir, ".git", "hooks", "prepare-commit-msg")
         with open(hook_path, "w") as f:
-            f.write(f"#!/bin/sh\nexec uv run --project '{PROJECT_DIR}' git-good hook \"$@\"\n")
+            f.write(
+                f'#!/bin/sh\n'
+                f'export PATH="{mock_dir}:$PATH"\n'
+                f"exec uv run --project '{PROJECT_DIR}' git-good hook \"$@\"\n"
+            )
         os.chmod(hook_path, 0o755)
 
+        # Step 2 — make code changes
         cast.blank()
         cast.comment("# Step 2: Make some changes to the code")
         cast.pause(0.8)
 
-        new_code = '\n\ndef add(a, b):\n    """Add two numbers and return the result."""\n    return a + b\n\n\ndef subtract(a, b):\n    """Subtract b from a and return the result."""\n    return a - b\n'
+        new_code = (
+            '\n\ndef add(a, b):\n'
+            '    """Add two numbers and return the result."""\n'
+            '    return a + b\n'
+            '\n\ndef subtract(a, b):\n'
+            '    """Subtract b from a and return the result."""\n'
+            '    return a - b\n'
+        )
         with open(app_py, "a") as f:
             f.write(new_code)
 
@@ -154,24 +183,27 @@ def main():
             cast.output(line)
         cast.pause(1.0)
 
+        # Step 3 — stage and commit with placeholder
         cast.blank()
-        cast.comment("# Step 3: Stage changes and commit with the @@claude@@ placeholder")
+        cast.comment("# Step 3: Stage and commit — let git-good write the message")
         cast.pause(0.8)
 
         cast.type_cmd("git add app.py")
         run(["git", "add", "app.py"], cwd=repo_dir)
         cast.pause(0.5)
 
-        cast.type_cmd("git commit -m '@@claude@@'")
+        cast.type_cmd("git commit -m '@@ai@@'")
         commit_output = run(
-            ["git", "commit", "-m", "@@claude@@"],
+            ["git", "commit", "-m", "@@ai@@"],
             cwd=repo_dir,
             env=demo_env,
         )
         for line in commit_output.strip().splitlines():
-            cast.output(line)
+            if line.strip():
+                cast.output(line)
         cast.pause(1.0)
 
+        # Step 4 — show the result
         cast.blank()
         cast.comment("# The placeholder was replaced with an AI-generated message!")
         cast.pause(0.8)
@@ -206,9 +238,8 @@ def main():
         print(f"SVG written to: {SVG_FILE}")
 
     finally:
-        mock_proc.kill()
-        mock_proc.wait()
         shutil.rmtree(demo_dir, ignore_errors=True)
+        shutil.rmtree(mock_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

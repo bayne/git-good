@@ -1,6 +1,6 @@
 # git-good
 
-AI-powered commit message generation via git hooks. Write `@@claude@@` as your commit message and let Claude fill it in.
+AI-powered commit message generation via git hooks. Write `@@ai@@` as your commit message and let Claude fill it in.
 
 ## Demo
 
@@ -9,7 +9,7 @@ AI-powered commit message generation via git hooks. Write `@@claude@@` as your c
 ## How it works
 
 1. Install the git hook into your repo
-2. When you commit, use `@@claude@@` as your message (or part of it)
+2. When you commit, use `@@ai@@` as your message (or part of it)
 3. The hook sends your staged diff to Claude and replaces the placeholder with a generated commit message
 
 ## Installation
@@ -29,10 +29,14 @@ git-good install
 git add -A
 
 # Commit with the placeholder — Claude writes the message
-git commit -m "@@claude@@"
+git commit -m "@@ai@@"
+
+# Or use the commit template (set up by git-good install)
+git commit
+# -> editor opens pre-filled with @@ai@@, replaced on save
 
 # You can also use it as part of a message
-git commit -m "@@claude@@
+git commit -m "@@ai@@
 
 Co-authored-by: Me <me@example.com>"
 ```
@@ -40,18 +44,20 @@ Co-authored-by: Me <me@example.com>"
 ## Requirements
 
 - Python >= 3.14
-- An `ANTHROPIC_API_KEY` environment variable set with your API key
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed and authenticated
 
 ## Development
 
 ```bash
-# Clone and install dev dependencies
-git clone https://github.com/youruser/git-good.git
+git clone https://github.com/bpayne/git-good.git
 cd git-good
 uv sync
 
 # Run tests
 uv run pytest tests/ -v
+
+# Re-record the demo
+uv run python scripts/record_demo.py
 ```
 
 ## License
