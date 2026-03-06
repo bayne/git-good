@@ -20,6 +20,24 @@ HOOK_SCRIPT = """\
 exec git-good hook "$@"
 """
 
+GLOBAL_HOOK_SCRIPT = """\
+#!/bin/sh
+# git-good: prepare-commit-msg hook (global)
+# Replaces @@ai@@ in commit messages with AI-generated text
+# Then chains to repo-local hook if one exists
+git-good hook "$@"
+GIT_GOOD_EXIT=$?
+
+# Chain to repo-local prepare-commit-msg hook if it exists
+LOCAL_HOOK="$(git rev-parse --git-dir)/hooks/prepare-commit-msg"
+if [ -x "$LOCAL_HOOK" ]; then
+    "$LOCAL_HOOK" "$@"
+    exit $?
+fi
+
+exit $GIT_GOOD_EXIT
+"""
+
 COMMIT_TEMPLATE = f"""\
 {PLACEHOLDER}
 """
@@ -47,50 +65,63 @@ def get_repo_root():
     return result.stdout.strip()
 
 
-def cmd_install(args):
-    repo_root = get_repo_root()
-    hooks_dir = os.path.join(repo_root, ".git", "hooks")
+def _confirm_hook_overwrite(hook_path, existing, script):
+    diff = difflib.unified_diff(
+        existing.splitlines(keepends=True),
+        script.splitlines(keepends=True),
+        fromfile="existing prepare-commit-msg",
+        tofile="new prepare-commit-msg",
+    )
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    CYAN = "\033[36m"
+    RESET = "\033[0m"
+    print(f"\n{hook_path} already exists. Proposed changes:\n", file=sys.stderr)
+    for line in diff:
+        if line.startswith("---") or line.startswith("+++"):
+            print(f"{CYAN}{line}{RESET}", end="", file=sys.stderr)
+        elif line.startswith("-"):
+            print(f"{RED}{line}{RESET}", end="", file=sys.stderr)
+        elif line.startswith("+"):
+            print(f"{GREEN}{line}{RESET}", end="", file=sys.stderr)
+        else:
+            print(line, end="", file=sys.stderr)
+    print(file=sys.stderr)
+
+    answer = input("Overwrite existing hook? [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def _install_hook(hooks_dir, script=HOOK_SCRIPT):
     hook_path = os.path.join(hooks_dir, "prepare-commit-msg")
 
     if os.path.exists(hook_path):
         with open(hook_path) as f:
             existing = f.read()
-        if existing == HOOK_SCRIPT:
+        if existing == script:
             print(f"Hook already installed at {hook_path}")
-        else:
-            diff = difflib.unified_diff(
-                existing.splitlines(keepends=True),
-                HOOK_SCRIPT.splitlines(keepends=True),
-                fromfile="existing prepare-commit-msg",
-                tofile="new prepare-commit-msg",
-            )
-            RED = "\033[31m"
-            GREEN = "\033[32m"
-            CYAN = "\033[36m"
-            RESET = "\033[0m"
-            print(f"\n{hook_path} already exists. Proposed changes:\n", file=sys.stderr)
-            for line in diff:
-                if line.startswith("---") or line.startswith("+++"):
-                    print(f"{CYAN}{line}{RESET}", end="", file=sys.stderr)
-                elif line.startswith("-"):
-                    print(f"{RED}{line}{RESET}", end="", file=sys.stderr)
-                elif line.startswith("+"):
-                    print(f"{GREEN}{line}{RESET}", end="", file=sys.stderr)
-                else:
-                    print(line, end="", file=sys.stderr)
-            print(file=sys.stderr)
-
-            answer = input("Overwrite existing hook? [y/N] ").strip().lower()
-            if answer not in ("y", "yes"):
-                print("Aborted.", file=sys.stderr)
-                return
+            return
+        if not _confirm_hook_overwrite(hook_path, existing, script):
+            print("Aborted.", file=sys.stderr)
+            return
 
     os.makedirs(hooks_dir, exist_ok=True)
     with open(hook_path, "w") as f:
-        f.write(HOOK_SCRIPT)
+        f.write(script)
     os.chmod(hook_path, os.stat(hook_path).st_mode | stat.S_IEXEC)
 
     print(f"Installed prepare-commit-msg hook to {hook_path}")
+
+
+def cmd_install(args):
+    if args.glob:
+        cmd_install_global(args)
+        return
+
+    repo_root = get_repo_root()
+    hooks_dir = os.path.join(repo_root, ".git", "hooks")
+
+    _install_hook(hooks_dir)
 
     # Create commit message template if one is not already configured
     result = subprocess.run(
@@ -113,6 +144,59 @@ def cmd_install(args):
             cwd=repo_root,
         )
         print(f"Created commit template at {template_rel}")
+
+
+GLOBAL_HOOKS_DIR = os.path.join(os.path.expanduser("~"), ".config", "git-good", "hooks")
+
+
+def cmd_install_global(args):
+    _install_hook(GLOBAL_HOOKS_DIR, script=GLOBAL_HOOK_SCRIPT)
+
+    # Set global core.hooksPath
+    result = subprocess.run(
+        ["git", "config", "--global", "core.hooksPath"],
+        capture_output=True,
+        text=True,
+    )
+    current = result.stdout.strip() if result.returncode == 0 else ""
+    if current and current != GLOBAL_HOOKS_DIR:
+        print(
+            f"Warning: core.hooksPath is already set to {current}",
+            file=sys.stderr,
+        )
+        answer = input(f"Override to {GLOBAL_HOOKS_DIR}? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Skipping core.hooksPath configuration.", file=sys.stderr)
+            return
+
+    if current != GLOBAL_HOOKS_DIR:
+        subprocess.run(
+            ["git", "config", "--global", "core.hooksPath", GLOBAL_HOOKS_DIR],
+            check=True,
+        )
+        print(f"Set global core.hooksPath to {GLOBAL_HOOKS_DIR}")
+    else:
+        print(f"Global core.hooksPath already set to {GLOBAL_HOOKS_DIR}")
+
+    # Set global commit template
+    result = subprocess.run(
+        ["git", "config", "--global", "commit.template"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        print(f"Global commit template already configured: {result.stdout.strip()}")
+    else:
+        template_path = os.path.join(
+            os.path.expanduser("~"), ".config", "git-good", ".git-commit-template"
+        )
+        with open(template_path, "w") as f:
+            f.write(COMMIT_TEMPLATE)
+        subprocess.run(
+            ["git", "config", "--global", "commit.template", template_path],
+            check=True,
+        )
+        print(f"Created global commit template at {template_path}")
 
 
 def _claim_foreground():
@@ -261,7 +345,13 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("install", help="Install the prepare-commit-msg hook")
+    install_parser = subparsers.add_parser("install", help="Install the prepare-commit-msg hook")
+    install_parser.add_argument(
+        "--global",
+        dest="glob",
+        action="store_true",
+        help="Install globally for all repos via core.hooksPath",
+    )
 
     hook_parser = subparsers.add_parser("hook", help="Hook entrypoint (called by git)")
     hook_parser.add_argument("commit_msg_file")

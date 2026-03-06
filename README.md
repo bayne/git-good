@@ -20,6 +20,9 @@ uv pip install git-good
 
 # In your git repo, install the hook
 git-good install
+
+# Or install globally for all repos
+git-good install --global
 ```
 
 ## Usage
