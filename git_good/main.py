@@ -102,7 +102,7 @@ def cmd_install(args):
     if result.returncode == 0 and result.stdout.strip():
         print(f"Commit template already configured: {result.stdout.strip()}")
     else:
-        template_rel = os.path.join(".git", "commit-template")
+        template_rel = os.path.join(".git-commit-template")
         template_abs = os.path.join(repo_root, template_rel)
         with open(template_abs, "w") as f:
             f.write(COMMIT_TEMPLATE)
