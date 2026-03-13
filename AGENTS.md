@@ -2,7 +2,7 @@
 
 ## Project overview
 
-**git-good** is an AI-powered commit message generator that works via a git `prepare-commit-msg` hook. When users include the `@@ai@@` placeholder in their commit message, the hook calls the `claude` CLI (Claude Code) with the staged diff and replaces the placeholder with a generated commit message. Since the hook runs before the editor opens, the user can review and edit the generated message before saving.
+**git-good** is an AI-powered commit message generator that works via a git `prepare-commit-msg` hook. When users include the `@@ai@@` placeholder in their commit message, the hook calls the Anthropic API directly (Claude Haiku) with the staged diff and full file contents for context, and replaces the placeholder with a generated commit message. Since the hook runs before the editor opens, the user can review and edit the generated message before saving.
 
 ## Architecture
 
@@ -32,19 +32,19 @@ Single-module design — everything is in `git_good/main.py`. The entry point is
 ## Development
 
 - Python >= 3.14, managed with `uv`
-- No Python dependencies; requires `claude` CLI (Claude Code) on PATH
+- Dependency: `anthropic` SDK; requires `ANTHROPIC_API_KEY` env var
 - Tests: `uv run pytest tests/ -v`
 - Demo: `uv run python scripts/record_demo.py`
 - Entry point: `git-good = "git_good.main:main"` (defined in pyproject.toml)
 
 ## Testing conventions
 
-- Unit tests mock `subprocess.run` to intercept both `git` and `claude` CLI calls
-- Functional tests create real temporary git repos via `tmp_path` fixture but mock the `claude` CLI call
+- Unit tests mock `subprocess.run` for git commands and `_run_api_with_spinner` for API calls
+- Functional tests create real temporary git repos via `tmp_path` fixture but mock `_run_api_with_spinner`
 - All tests use pytest with `monkeypatch` for patching
 
 ## Code style
 
 - Keep everything in `main.py` unless the module grows significantly
 - Use `sys.stderr` for warnings/errors, `sys.stdout` for success messages
-- Fail gracefully: if the `claude` CLI call fails, leave the placeholder as-is and print a warning
+- Fail gracefully: if the API call fails, leave the placeholder as-is and print a warning

@@ -11,11 +11,15 @@ import pytest
 
 from git_good.main import (
     COMMIT_TEMPLATE,
+    CONFIG_FILE,
     HOOK_SCRIPT,
     PLACEHOLDER,
     SPINNER_FRAMES,
     SYSTEM_PROMPT,
-    _run_claude_with_spinner,
+    _get_api_key,
+    _get_staged_file_contents,
+    _load_config,
+    _run_api_with_spinner,
     cmd_hook,
     cmd_install,
     get_repo_root,
@@ -61,6 +65,41 @@ class TestGetRepoRoot:
 
 
 # ---------------------------------------------------------------------------
+# _load_config / _get_api_key
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConfig:
+    def test_returns_empty_dict_when_no_file(self, monkeypatch):
+        monkeypatch.setattr("git_good.main.CONFIG_FILE", "/nonexistent/config.toml")
+        assert _load_config() == {}
+
+    def test_reads_toml_file(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('api_key = "sk-test-123"\n')
+        monkeypatch.setattr("git_good.main.CONFIG_FILE", str(config_file))
+        assert _load_config() == {"api_key": "sk-test-123"}
+
+
+class TestGetApiKey:
+    def test_returns_key_from_config(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('api_key = "sk-from-config"\n')
+        monkeypatch.setattr("git_good.main.CONFIG_FILE", str(config_file))
+        assert _get_api_key() == "sk-from-config"
+
+    def test_returns_none_when_no_config(self, monkeypatch):
+        monkeypatch.setattr("git_good.main.CONFIG_FILE", "/nonexistent/config.toml")
+        assert _get_api_key() is None
+
+    def test_returns_none_when_key_not_in_config(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('other_setting = "value"\n')
+        monkeypatch.setattr("git_good.main.CONFIG_FILE", str(config_file))
+        assert _get_api_key() is None
+
+
+# ---------------------------------------------------------------------------
 # cmd_install
 # ---------------------------------------------------------------------------
 
@@ -72,7 +111,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
-        args = mock.MagicMock()
+        args = mock.MagicMock(glob=False)
         cmd_install(args)
 
         hook_path = git_dir / "prepare-commit-msg"
@@ -84,7 +123,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
 
         hook_path = tmp_path / ".git" / "hooks" / "prepare-commit-msg"
         mode = hook_path.stat().st_mode
@@ -95,7 +134,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
         assert (tmp_path / ".git" / "hooks" / "prepare-commit-msg").exists()
 
     def test_overwrites_existing_hook_after_confirmation(self, tmp_path, monkeypatch, capsys):
@@ -108,7 +147,7 @@ class TestCmdInstall:
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
         monkeypatch.setattr("builtins.input", lambda _: "y")
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
 
         assert existing.read_text() == HOOK_SCRIPT
         err = capsys.readouterr().err
@@ -126,7 +165,7 @@ class TestCmdInstall:
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
         monkeypatch.setattr("builtins.input", lambda _: "n")
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
 
         assert existing.read_text() == "#!/bin/sh\nold hook"
         assert "Aborted" in capsys.readouterr().err
@@ -140,7 +179,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
 
         assert "already installed" in capsys.readouterr().out
 
@@ -149,7 +188,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
         assert "Installed" in capsys.readouterr().out
 
     def test_creates_commit_template(self, tmp_path, monkeypatch):
@@ -170,9 +209,9 @@ class TestCmdInstall:
             return original_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
 
-        template_path = tmp_path / ".git" / "commit-template"
+        template_path = tmp_path / ".git-commit-template"
         assert template_path.exists()
         assert PLACEHOLDER in template_path.read_text()
         # Should have called git config to set the template
@@ -191,9 +230,9 @@ class TestCmdInstall:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        cmd_install(mock.MagicMock())
+        cmd_install(mock.MagicMock(glob=False))
 
-        template_path = tmp_path / ".git" / "commit-template"
+        template_path = tmp_path / ".git-commit-template"
         assert not template_path.exists()
         assert "already configured" in capsys.readouterr().out
 
@@ -205,69 +244,133 @@ class TestCmdInstall:
 
 
 # ---------------------------------------------------------------------------
-# _run_claude_with_spinner (helper)
+# _get_staged_file_contents
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_popen(stdout="", stderr="", returncode=0):
-    """Create a mock Popen that simulates claude CLI."""
-    mock_proc = mock.MagicMock()
-    mock_proc.communicate.return_value = (stdout, stderr)
-    mock_proc.returncode = returncode
-    mock_proc.poll.return_value = returncode
-    # Make kill/wait no-ops
-    mock_proc.kill.return_value = None
-    mock_proc.wait.return_value = returncode
-    return mock_proc
+class TestGetStagedFileContents:
+    def test_returns_file_contents(self, tmp_path, monkeypatch):
+        (tmp_path / "foo.py").write_text("print('hello')\n")
+        monkeypatch.chdir(tmp_path)
+
+        def fake_run(cmd, *args, **kwargs):
+            if "diff" in cmd and "--name-only" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="foo.py\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_staged_file_contents()
+        assert "foo.py" in result
+        assert "print('hello')" in result
+
+    def test_skips_deleted_files(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        def fake_run(cmd, *args, **kwargs):
+            if "diff" in cmd and "--name-only" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="deleted.py\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_staged_file_contents()
+        assert result == ""
+
+    def test_handles_empty_diff(self, monkeypatch):
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_staged_file_contents()
+        assert result == ""
 
 
-class TestRunClaudeWithSpinner:
-    def test_returns_result_on_success(self, monkeypatch):
-        mock_proc = _make_mock_popen(stdout="Fix bug in parser", returncode=0)
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: mock_proc)
-        result = _run_claude_with_spinner("prompt")
-        assert result is not None
-        assert result["stdout"] == "Fix bug in parser"
-        assert result["returncode"] == 0
+# ---------------------------------------------------------------------------
+# _run_api_with_spinner
+# ---------------------------------------------------------------------------
 
-    def test_passes_prompt_via_stdin(self, monkeypatch):
-        mock_proc = _make_mock_popen(stdout="msg", returncode=0)
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: mock_proc)
-        _run_claude_with_spinner("my prompt text")
-        mock_proc.communicate.assert_called_once_with(input="my prompt text", timeout=30)
 
-    def test_uses_correct_claude_flags(self, monkeypatch):
-        popen_calls = []
+def _make_mock_response(text="Fix bug in parser"):
+    """Create a mock Anthropic API response."""
+    mock_content = mock.MagicMock()
+    mock_content.text = text
+    mock_response = mock.MagicMock()
+    mock_response.content = [mock_content]
+    return mock_response
 
-        def fake_popen(cmd, **kwargs):
-            popen_calls.append(cmd)
-            return _make_mock_popen(stdout="msg", returncode=0)
 
-        monkeypatch.setattr(subprocess, "Popen", fake_popen)
-        _run_claude_with_spinner("prompt")
-        cmd = popen_calls[0]
-        assert cmd == ["claude", "--print", "--no-session-persistence", "--model", "haiku"]
+class TestRunApiWithSpinner:
+    def test_returns_text_on_success(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("Fix bug in parser")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
 
-    def test_handles_timeout(self, monkeypatch):
-        mock_proc = mock.MagicMock()
-        mock_proc.communicate.side_effect = [
-            subprocess.TimeoutExpired(["claude"], 30),
-            ("", ""),  # second communicate after kill
-        ]
-        mock_proc.returncode = -1
-        mock_proc.poll.return_value = -1
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: mock_proc)
-        result = _run_claude_with_spinner("prompt")
-        assert result is not None
-        assert result["returncode"] == -1
-        assert "timed out" in result["stderr"]
+        result = _run_api_with_spinner("diff content", "file contents")
+        assert result == "Fix bug in parser"
 
-    def test_returns_nonzero_on_failure(self, monkeypatch):
-        mock_proc = _make_mock_popen(stdout="", stderr="error msg", returncode=1)
-        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: mock_proc)
-        result = _run_claude_with_spinner("prompt")
-        assert result["returncode"] == 1
-        assert result["stderr"] == "error msg"
+    def test_sends_diff_in_user_message(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("msg")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        _run_api_with_spinner("my diff content", "")
+        call_kwargs = mock_client.messages.create.call_args[1]
+        user_msg = call_kwargs["messages"][0]["content"]
+        assert "my diff content" in user_msg
+
+    def test_sends_file_contents_when_provided(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("msg")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        _run_api_with_spinner("diff", "=== foo.py ===\nprint('hi')")
+        call_kwargs = mock_client.messages.create.call_args[1]
+        user_msg = call_kwargs["messages"][0]["content"]
+        assert "foo.py" in user_msg
+        assert "print('hi')" in user_msg
+
+    def test_omits_files_tag_when_no_contents(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("msg")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        _run_api_with_spinner("diff", "")
+        call_kwargs = mock_client.messages.create.call_args[1]
+        user_msg = call_kwargs["messages"][0]["content"]
+        assert "<files>" not in user_msg
+
+    def test_uses_haiku_model(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("msg")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        _run_api_with_spinner("diff", "")
+        call_kwargs = mock_client.messages.create.call_args[1]
+        assert call_kwargs["model"] == "claude-haiku-4-5-20251001"
+
+    def test_sends_system_prompt(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("msg")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        _run_api_with_spinner("diff", "")
+        call_kwargs = mock_client.messages.create.call_args[1]
+        assert call_kwargs["system"] == SYSTEM_PROMPT
+
+    def test_raises_on_api_error(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.side_effect = Exception("API error")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        with pytest.raises(RuntimeError, match="API error"):
+            _run_api_with_spinner("diff", "")
+
+    def test_strips_whitespace_from_response(self, monkeypatch):
+        mock_client = mock.MagicMock()
+        mock_client.messages.create.return_value = _make_mock_response("  Fix bug  \n\n")
+        monkeypatch.setattr("git_good.main.anthropic.Anthropic", lambda **kw: mock_client)
+
+        result = _run_api_with_spinner("diff", "")
+        assert result == "Fix bug"
 
 
 # ---------------------------------------------------------------------------
@@ -275,25 +378,29 @@ class TestRunClaudeWithSpinner:
 # ---------------------------------------------------------------------------
 
 
-def _make_hook_mocks(monkeypatch, diff_stdout="", claude_stdout="", claude_returncode=0, claude_stderr=""):
-    """Set up mocks for cmd_hook: mock git diff via subprocess.run, mock claude via _run_claude_with_spinner."""
-    # Mock git diff
+def _make_hook_mocks(monkeypatch, diff_stdout="", api_response="", api_error=None, file_contents=""):
+    """Set up mocks for cmd_hook: mock git diff via subprocess.run, mock _run_api_with_spinner."""
+    # Mock git diff and git diff --name-only
     def fake_run(cmd, *args, **kwargs):
         if cmd[0] == "git" and "diff" in cmd:
+            if "--name-only" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout=diff_stdout, stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    # Mock _run_claude_with_spinner
-    claude_calls = []
+    # Mock _run_api_with_spinner
+    api_calls = []
 
-    def fake_spinner(prompt):
-        claude_calls.append(prompt)
-        return {"stdout": claude_stdout, "stderr": claude_stderr, "returncode": claude_returncode}
+    def fake_api(diff, file_contents):
+        api_calls.append({"diff": diff, "file_contents": file_contents})
+        if api_error:
+            raise RuntimeError(api_error)
+        return api_response
 
-    monkeypatch.setattr("git_good.main._run_claude_with_spinner", fake_spinner)
-    return claude_calls
+    monkeypatch.setattr("git_good.main._run_api_with_spinner", fake_api)
+    return api_calls
 
 
 class TestCmdHook:
@@ -341,7 +448,7 @@ class TestCmdHook:
         _make_hook_mocks(
             monkeypatch,
             diff_stdout="diff --git a/foo.py ...\n+print('hello')\n",
-            claude_stdout="Add hello print statement",
+            api_response="Add hello print statement",
         )
 
         cmd_hook(self._make_args(str(msg_file)))
@@ -355,7 +462,7 @@ class TestCmdHook:
         _make_hook_mocks(
             monkeypatch,
             diff_stdout="diff content\n",
-            claude_stdout="Fix bug in parser",
+            api_response="Fix bug in parser",
         )
 
         cmd_hook(self._make_args(str(msg_file)))
@@ -364,7 +471,7 @@ class TestCmdHook:
         assert result.startswith("prefix: Fix bug in parser")
         assert "# Some comment" in result
 
-    def test_handles_claude_error_gracefully(self, tmp_path, monkeypatch, capsys):
+    def test_handles_api_error_gracefully(self, tmp_path, monkeypatch, capsys):
         msg_file = tmp_path / "COMMIT_EDITMSG"
         original_text = f"commit: {PLACEHOLDER}"
         msg_file.write_text(original_text)
@@ -372,8 +479,7 @@ class TestCmdHook:
         _make_hook_mocks(
             monkeypatch,
             diff_stdout="diff content\n",
-            claude_returncode=1,
-            claude_stderr="claude not found",
+            api_error="API key not found",
         )
 
         cmd_hook(self._make_args(str(msg_file)))
@@ -384,7 +490,7 @@ class TestCmdHook:
         assert "failed to generate" in err
         assert "leaving placeholder" in err
 
-    def test_handles_empty_claude_response(self, tmp_path, monkeypatch, capsys):
+    def test_handles_empty_api_response(self, tmp_path, monkeypatch, capsys):
         msg_file = tmp_path / "COMMIT_EDITMSG"
         original_text = f"{PLACEHOLDER}"
         msg_file.write_text(original_text)
@@ -392,7 +498,7 @@ class TestCmdHook:
         _make_hook_mocks(
             monkeypatch,
             diff_stdout="diff content\n",
-            claude_stdout="",
+            api_response="",
         )
 
         cmd_hook(self._make_args(str(msg_file)))
@@ -401,67 +507,41 @@ class TestCmdHook:
         assert "failed to generate" in capsys.readouterr().err
 
     def test_handles_interrupted_gracefully(self, tmp_path, monkeypatch, capsys):
-        """When _run_claude_with_spinner returns None (interrupted), leave placeholder."""
+        """When _run_api_with_spinner returns None (interrupted), leave placeholder."""
         msg_file = tmp_path / "COMMIT_EDITMSG"
         original_text = f"{PLACEHOLDER}"
         msg_file.write_text(original_text)
 
         def fake_run(cmd, *args, **kwargs):
             if cmd[0] == "git" and "diff" in cmd:
+                if "--name-only" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
                 return subprocess.CompletedProcess(cmd, 0, stdout="diff content\n", stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        monkeypatch.setattr("git_good.main._run_claude_with_spinner", lambda prompt: None)
+        monkeypatch.setattr("git_good.main._run_api_with_spinner", lambda diff, fc: None)
 
         cmd_hook(self._make_args(str(msg_file)))
 
         assert msg_file.read_text() == original_text
         assert "interrupted" in capsys.readouterr().err
 
-    def test_sends_diff_to_claude(self, tmp_path, monkeypatch):
+    def test_sends_diff_to_api(self, tmp_path, monkeypatch):
         msg_file = tmp_path / "COMMIT_EDITMSG"
         msg_file.write_text(PLACEHOLDER)
 
         diff_content = "diff --git a/main.py b/main.py\n+new line\n"
-        claude_calls = _make_hook_mocks(
+        api_calls = _make_hook_mocks(
             monkeypatch,
             diff_stdout=diff_content,
-            claude_stdout="Update main",
+            api_response="Update main",
         )
 
         cmd_hook(self._make_args(str(msg_file)))
 
-        # The prompt sent to claude should contain the diff
-        assert diff_content in claude_calls[0]
-
-    def test_sends_system_prompt_to_claude(self, tmp_path, monkeypatch):
-        msg_file = tmp_path / "COMMIT_EDITMSG"
-        msg_file.write_text(PLACEHOLDER)
-
-        claude_calls = _make_hook_mocks(
-            monkeypatch,
-            diff_stdout="diff\n",
-            claude_stdout="msg",
-        )
-
-        cmd_hook(self._make_args(str(msg_file)))
-
-        assert "imperative" in claude_calls[0].lower()
-
-    def test_strips_whitespace_from_claude_response(self, tmp_path, monkeypatch):
-        msg_file = tmp_path / "COMMIT_EDITMSG"
-        msg_file.write_text(PLACEHOLDER)
-
-        _make_hook_mocks(
-            monkeypatch,
-            diff_stdout="diff\n",
-            claude_stdout="  Fix bug  \n\n",
-        )
-
-        cmd_hook(self._make_args(str(msg_file)))
-
-        assert msg_file.read_text() == "Fix bug"
+        # The diff sent to the API should contain the diff content
+        assert diff_content in api_calls[0]["diff"]
 
     def test_only_replaces_first_placeholder(self, tmp_path, monkeypatch):
         """str.replace replaces all occurrences - verify behavior."""
@@ -471,7 +551,7 @@ class TestCmdHook:
         _make_hook_mocks(
             monkeypatch,
             diff_stdout="diff\n",
-            claude_stdout="Update",
+            api_response="Update",
         )
 
         cmd_hook(self._make_args(str(msg_file)))

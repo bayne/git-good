@@ -1,0 +1,5 @@
+# git-good configuration
+# Copy to ~/.config/git-good/config.toml
+
+# Anthropic API key (falls back to ANTHROPIC_API_KEY env var if not set)
+# api_key = "sk-ant-..."

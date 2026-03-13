@@ -4,7 +4,7 @@ version = "0.6.0"
 description = "AI-powered commit message generation via git hooks"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["anthropic"]
 
 [project.scripts]
 git-good = "git_good.main:main"

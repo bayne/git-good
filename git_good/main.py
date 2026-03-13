@@ -7,7 +7,9 @@ import subprocess
 import sys
 import textwrap
 import threading
-import time
+import tomllib
+
+import anthropic
 
 PLACEHOLDER = "@@ai@@"
 
@@ -146,7 +148,37 @@ def cmd_install(args):
         print(f"Created commit template at {template_rel}")
 
 
-GLOBAL_HOOKS_DIR = os.path.join(os.path.expanduser("~"), ".config", "git-good", "hooks")
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "git-good")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
+GLOBAL_HOOKS_DIR = os.path.join(CONFIG_DIR, "hooks")
+
+
+def _install_alias(name, command):
+    """Install a global git alias if not already set."""
+    result = subprocess.run(
+        ["git", "config", "--global", f"alias.{name}"],
+        capture_output=True,
+        text=True,
+    )
+    current = result.stdout.strip() if result.returncode == 0 else ""
+    if current == command:
+        print(f"Git alias '{name}' already configured")
+        return
+    if current:
+        print(f"Warning: alias.{name} is already set to: {current}", file=sys.stderr)
+        answer = input(f"Override with '{command}'? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print(f"Skipping alias.{name} configuration.", file=sys.stderr)
+            return
+    subprocess.run(
+        ["git", "config", "--global", f"alias.{name}", command],
+        check=True,
+    )
+    print(f"Installed git alias '{name}'")
+
+
+ALIAS_GOOD = f'!git commit -m "{PLACEHOLDER}"'
+ALIAS_YOLO = f'!git commit -m "{PLACEHOLDER}" && git push'
 
 
 def cmd_install_global(args):
@@ -198,6 +230,14 @@ def cmd_install_global(args):
         )
         print(f"Created global commit template at {template_path}")
 
+    # Install git aliases
+    _install_alias("good", ALIAS_GOOD)
+    _install_alias("yolo", ALIAS_YOLO)
+
+
+def cmd_yolo(args):
+    _install_alias("yolo", ALIAS_YOLO)
+
 
 def _claim_foreground():
     """Become the foreground process group so Ctrl+C only signals us, not git."""
@@ -227,35 +267,71 @@ def _restore_foreground(tty_fd, original_pgrp):
         os.close(tty_fd)
 
 
-def _run_claude_with_spinner(prompt):
-    """Run claude CLI with a spinner, returning (stdout, stderr, returncode).
-
-    If the user sends SIGINT (Ctrl+C), the claude process is killed and
-    the function returns None so the caller can continue gracefully.
-    """
-    proc = subprocess.Popen(
-        ["claude", "--print", "--no-session-persistence", "--model", "haiku"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+def _get_staged_file_contents():
+    """Get the full content of staged files for context."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        capture_output=True,
         text=True,
     )
+    files = [f for f in result.stdout.strip().split("\n") if f]
 
-    result = {"stdout": "", "stderr": "", "returncode": None}
-
-    def communicate():
+    contents = []
+    for filepath in files:
         try:
-            stdout, stderr = proc.communicate(input=prompt, timeout=30)
-            result["stdout"] = stdout
-            result["stderr"] = stderr
-            result["returncode"] = proc.returncode
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            result["returncode"] = -1
-            result["stderr"] = "timed out after 30 seconds"
+            with open(filepath) as f:
+                content = f.read()
+            contents.append(f"=== {filepath} ===\n{content}")
+        except (FileNotFoundError, IsADirectoryError, PermissionError):
+            pass
 
-    thread = threading.Thread(target=communicate)
+    return "\n\n".join(contents)
+
+
+def _load_config():
+    """Load config from ~/.config/git-good/config.toml, returning a dict."""
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def _get_api_key():
+    """Get the API key from the config file, falling back to env var."""
+    config = _load_config()
+    return config.get("api_key")
+
+
+def _run_api_with_spinner(diff, file_contents):
+    """Call Anthropic API with a spinner, returning the commit message text.
+
+    If the user sends SIGINT (Ctrl+C), the function returns None so the
+    caller can continue gracefully.
+    """
+    result = {"text": None, "error": None}
+
+    def call_api():
+        try:
+            client = anthropic.Anthropic(api_key=_get_api_key())
+            user_message = f"<diff>\n{diff}\n</diff>"
+            if file_contents:
+                user_message = (
+                    f"<files>\n{file_contents}\n</files>\n\n{user_message}"
+                )
+
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+                timeout=30.0,
+            )
+            result["text"] = response.content[0].text.strip()
+        except Exception as e:
+            result["error"] = str(e)
+
+    thread = threading.Thread(target=call_api)
     thread.start()
 
     # Become the foreground process group so Ctrl+C during the spinner only
@@ -276,15 +352,18 @@ def _run_claude_with_spinner(prompt):
             spinner_idx += 1
             thread.join(timeout=0.1)
     except KeyboardInterrupt:
-        proc.kill()
-        thread.join()
         interrupted = True
+        thread.join(timeout=2)
     finally:
         # Clear the spinner line
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr, flush=True)
         _restore_foreground(tty_fd, original_pgrp)
 
-    return None if interrupted else result
+    if interrupted:
+        return None
+    if result["error"]:
+        raise RuntimeError(result["error"])
+    return result["text"]
 
 
 def cmd_hook(args):
@@ -306,24 +385,18 @@ def cmd_hook(args):
         print("git-good: no staged changes found, leaving placeholder", file=sys.stderr)
         return
 
-    prompt = f"{SYSTEM_PROMPT}\n\nGenerate a commit message for this diff:\n\n{diff}"
+    file_contents = _get_staged_file_contents()
 
     try:
-        result = _run_claude_with_spinner(prompt)
+        commit_msg = _run_api_with_spinner(diff, file_contents)
 
-        if result is None:
+        if commit_msg is None:
             # Interrupted by user — continue the commit with placeholder
             print("git-good: interrupted, leaving placeholder as-is", file=sys.stderr)
             return
 
-        if result["returncode"] != 0:
-            raise RuntimeError(
-                result["stderr"].strip()
-                or f"claude exited with code {result['returncode']}"
-            )
-        commit_msg = result["stdout"].strip()
         if not commit_msg:
-            raise RuntimeError("claude returned empty response")
+            raise RuntimeError("API returned empty response")
     except KeyboardInterrupt:
         print("git-good: interrupted, leaving placeholder as-is", file=sys.stderr)
         return
@@ -358,12 +431,16 @@ def main():
     hook_parser.add_argument("source", nargs="?", default="")
     hook_parser.add_argument("sha", nargs="?", default="")
 
+    subparsers.add_parser("yolo", help="Install 'git yolo' alias (commit with AI message + push)")
+
     args = parser.parse_args()
 
     if args.command == "install":
         cmd_install(args)
     elif args.command == "hook":
         cmd_hook(args)
+    elif args.command == "yolo":
+        cmd_yolo(args)
     else:
         parser.print_help()
 
