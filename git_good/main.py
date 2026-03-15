@@ -115,13 +115,30 @@ def _install_hook(hooks_dir, script=HOOK_SCRIPT):
     print(f"Installed prepare-commit-msg hook to {hook_path}")
 
 
+def _get_hooks_dir(repo_root):
+    """Get the effective hooks directory, respecting core.hooksPath if configured."""
+    result = subprocess.run(
+        ["git", "config", "core.hooksPath"],
+        capture_output=True,
+        text=True,
+        cwd=repo_root,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        hooks_path = result.stdout.strip()
+        # Resolve relative paths against repo root
+        if not os.path.isabs(hooks_path):
+            hooks_path = os.path.join(repo_root, hooks_path)
+        return hooks_path
+    return os.path.join(repo_root, ".git", "hooks")
+
+
 def cmd_install(args):
     if args.glob:
         cmd_install_global(args)
         return
 
     repo_root = get_repo_root()
-    hooks_dir = os.path.join(repo_root, ".git", "hooks")
+    hooks_dir = _get_hooks_dir(repo_root)
 
     _install_hook(hooks_dir)
 

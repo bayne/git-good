@@ -17,6 +17,7 @@ from git_good.main import (
     SPINNER_FRAMES,
     SYSTEM_PROMPT,
     _get_api_key,
+    _get_hooks_dir,
     _get_staged_file_contents,
     _load_config,
     _run_api_with_spinner,
@@ -104,13 +105,66 @@ class TestGetApiKey:
 # ---------------------------------------------------------------------------
 
 
+class TestGetHooksDir:
+    def test_returns_default_when_no_config(self, tmp_path, monkeypatch):
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_hooks_dir(str(tmp_path))
+        assert result == os.path.join(str(tmp_path), ".git", "hooks")
+
+    def test_returns_configured_absolute_path(self, tmp_path, monkeypatch):
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="/custom/hooks\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_hooks_dir(str(tmp_path))
+        assert result == "/custom/hooks"
+
+    def test_resolves_relative_path_against_repo_root(self, tmp_path, monkeypatch):
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="my-hooks\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_hooks_dir(str(tmp_path))
+        assert result == os.path.join(str(tmp_path), "my-hooks")
+
+    def test_passes_repo_root_as_cwd(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(kwargs)
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        _get_hooks_dir(str(tmp_path))
+        assert calls[0]["cwd"] == str(tmp_path)
+
+    def test_ignores_empty_config_value(self, tmp_path, monkeypatch):
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="  \n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = _get_hooks_dir(str(tmp_path))
+        assert result == os.path.join(str(tmp_path), ".git", "hooks")
+
+
 class TestCmdInstall:
+    def _patch_hooks_dir(self, monkeypatch, tmp_path):
+        """Monkeypatch _get_hooks_dir to return .git/hooks under tmp_path."""
+        hooks_dir = str(tmp_path / ".git" / "hooks")
+        monkeypatch.setattr(
+            "git_good.main._get_hooks_dir", lambda repo_root: hooks_dir
+        )
+
     def test_creates_hook_file(self, tmp_path, monkeypatch):
         git_dir = tmp_path / ".git" / "hooks"
         git_dir.mkdir(parents=True)
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         args = mock.MagicMock(glob=False)
         cmd_install(args)
 
@@ -123,6 +177,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         cmd_install(mock.MagicMock(glob=False))
 
         hook_path = tmp_path / ".git" / "hooks" / "prepare-commit-msg"
@@ -134,6 +189,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         cmd_install(mock.MagicMock(glob=False))
         assert (tmp_path / ".git" / "hooks" / "prepare-commit-msg").exists()
 
@@ -146,6 +202,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         monkeypatch.setattr("builtins.input", lambda _: "y")
         cmd_install(mock.MagicMock(glob=False))
 
@@ -164,6 +221,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         monkeypatch.setattr("builtins.input", lambda _: "n")
         cmd_install(mock.MagicMock(glob=False))
 
@@ -179,6 +237,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         cmd_install(mock.MagicMock(glob=False))
 
         assert "already installed" in capsys.readouterr().out
@@ -188,14 +247,31 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         cmd_install(mock.MagicMock(glob=False))
         assert "Installed" in capsys.readouterr().out
+
+    def test_uses_custom_hooks_path(self, tmp_path, monkeypatch, capsys):
+        """When core.hooksPath is set, install hook there instead of .git/hooks."""
+        custom_hooks = tmp_path / "custom-hooks"
+        monkeypatch.setattr(
+            "git_good.main.get_repo_root", lambda: str(tmp_path)
+        )
+        monkeypatch.setattr(
+            "git_good.main._get_hooks_dir", lambda repo_root: str(custom_hooks)
+        )
+        cmd_install(mock.MagicMock(glob=False))
+
+        hook_path = custom_hooks / "prepare-commit-msg"
+        assert hook_path.exists()
+        assert hook_path.read_text() == HOOK_SCRIPT
 
     def test_creates_commit_template(self, tmp_path, monkeypatch):
         (tmp_path / ".git" / "hooks").mkdir(parents=True)
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
         git_config_calls = []
         original_run = subprocess.run
 
@@ -223,6 +299,7 @@ class TestCmdInstall:
         monkeypatch.setattr(
             "git_good.main.get_repo_root", lambda: str(tmp_path)
         )
+        self._patch_hooks_dir(monkeypatch, tmp_path)
 
         def fake_run(cmd, *args, **kwargs):
             if cmd == ["git", "config", "commit.template"]:

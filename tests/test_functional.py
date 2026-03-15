@@ -17,6 +17,10 @@ from git_good.main import COMMIT_TEMPLATE, PLACEHOLDER, cmd_hook, cmd_install
 @pytest.fixture()
 def git_repo(tmp_path, monkeypatch):
     """Create a temporary git repo, cd into it, and return its path."""
+    # Isolate from global/system git config so tests don't pick up
+    # settings like core.hooksPath from the user's environment
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     subprocess.run(["git", "init", str(tmp_path)], capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
@@ -64,7 +68,7 @@ class TestInstallFunctional:
 
     def test_install_creates_commit_template(self, git_repo, capsys):
         cmd_install(mock.MagicMock(glob=False))
-        template_path = git_repo / ".git" / "commit-template"
+        template_path = git_repo / ".git-commit-template"
         assert template_path.exists()
         assert PLACEHOLDER in template_path.read_text()
         assert "Created commit template" in capsys.readouterr().out
